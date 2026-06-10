@@ -38,12 +38,12 @@ LOG_PATH = HOME / 'cdnbuddy.log'
 CACHE_DIR = HOME / 'cache'
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Size presets (width in px) — matches blog cover pattern
+# Size presets (width in px, quality) — aligned with Boottify THUMBNAIL_VARIANTS
 SIZES = {
-    'xs': 200,
-    'sm': 480,
-    'md': 768,
-    'lg': 1280,
+    'xs': {'width': 120, 'quality': 72},
+    'sm': {'width': 480, 'quality': 76},
+    'md': {'width': 768, 'quality': 78},
+    'lg': {'width': 1200, 'quality': 80},
 }
 
 # S3/CDN config — from env or ~/.cdnbuddy/config.json
@@ -194,13 +194,13 @@ def process_image(filepath: str, cfg: dict) -> bool:
     cdn_urls = {}
     variants_ok = 0
 
-    for label, target_w in SIZES.items():
+    for label, size_cfg in SIZES.items():
         # Only downscale — skip if original is smaller
-        if target_w >= orig_w:
+        if size_cfg['width'] >= orig_w:
             continue
 
         # Calculate proportional height
-        ratio = target_w / orig_w
+        ratio = size_cfg['width'] / orig_w
         target_h = int(orig_h * ratio)
 
         # Generate variant
@@ -208,8 +208,8 @@ def process_image(filepath: str, cfg: dict) -> bool:
         variant_local = str(variant_path)
 
         # Create resized copy
-        resized = img.resize((target_w, target_h), Image.LANCZOS)
-        resized.save(variant_local, 'WEBP', quality=cfg['quality'])
+        resized = img.resize((size_cfg['width'], target_h), Image.LANCZOS)
+        resized.save(variant_local, 'WEBP', quality=size_cfg['quality'])
 
         v_size = os.path.getsize(variant_local)
 
@@ -222,7 +222,7 @@ def process_image(filepath: str, cfg: dict) -> bool:
             INSERT OR REPLACE INTO variants
             (image_id, size_label, width, height, local_path, cdn_url, file_size, processed_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (img_id, label, target_w, target_h, variant_local, cdn_url, v_size, now))
+        """, (img_id, label, size_cfg['width'], target_h, variant_local, cdn_url, v_size, now))
 
         cdn_urls[label] = cdn_url
         variants_ok += 1
@@ -308,7 +308,8 @@ def watch_loop(cfg: dict):
     print(f"CDNBuddy v{VERSION} — watching for uploads...")
     print(f"  Dirs: {cfg['watch_dirs']}")
     print(f"  CDN:  {cfg['cdn_base_url']}")
-    print(f"  Sizes: {', '.join(f'{k}({v}px)' for k,v in SIZES.items())}")
+    sizes_str = ', '.join(f'{k}({v["width"]}px)' for k, v in SIZES.items())
+    print(f"  Sizes: {sizes_str}")
     print()
 
     try:
@@ -477,7 +478,8 @@ def cmd_status(args):
     print(f"  Images:   {total} total ({synced} synced, {pending} pending, {errors} errors)")
     print(f"  Variants: {variants}")
     print(f"  CDN:      {cfg['cdn_base_url']}")
-    print(f"  Sizes:    {', '.join(f'{k}({v}px)' for k,v in SIZES.items())}")
+    sizes_str = ', '.join(f'{k}({v["width"]}px)' for k, v in SIZES.items())
+    print(f"  Sizes:    {sizes_str}")
 
     # Recent errors
     err_rows = db.execute(
