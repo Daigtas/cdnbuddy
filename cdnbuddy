@@ -358,7 +358,7 @@ def watch_loop(cfg: dict):
 def create_api(cfg: dict):
     """Create FastAPI app for CDNBuddy"""
     try:
-        from fastapi import FastAPI, HTTPException
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
         import uvicorn
     except ImportError:
@@ -397,7 +397,17 @@ def create_api(cfg: dict):
         return {'synced': count, 'message': f'Synced {count} images'}
 
     @app.post("/api/process")
-    def trigger_process(path: str):
+    async def trigger_process(request: Request):
+        # Accept path from either query param or form body
+        path = request.query_params.get("path")
+        if not path:
+            try:
+                body = await request.form()
+                path = body.get("path")
+            except Exception:
+                pass
+        if not path:
+            raise HTTPException(400, "Missing 'path' parameter")
         if not os.path.isfile(path):
             raise HTTPException(404, f"File not found: {path}")
         ok = process_image(path, cfg)
