@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""
+CDNBuddy v1.0.0 — Background CDN sync & image optimization daemon.
+
+Watches upload directories, converts images to WebP at responsive sizes,
+uploads to S3/CloudFront CDN, and reports status via CLI + API.
+Local files kept as fallback.
+
+Usage:
+  cdnbuddy watch <dir>          Start watching a directory
+  cdnbuddy sync <dir>           Manual full sync
+  cdnbuddy process <file>       Process single image
+  cdnbuddy status               Show sync status
+  cdnbuddy serve                Start API server
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+VERSION = "1.0.0"
+
+# ── Config defaults ───────────────────────────────────────────────
+HOME = Path(os.environ.get('CDNBUDDY_HOME', os.path.expanduser('~/.cdnbuddy')))
+HOME.mkdir(parents=True, exist_ok=True)
+DB_PATH = HOME / 'cdnbuddy.db'
+LOG_PATH = HOME / 'cdnbuddy.log'
+CACHE_DIR = HOME / 'cache'
+CACHE_DIR.mkdir(exist_ok=True)
+
+# Size presets (width in px) — matches blog cover pattern
+SIZES = {
+    'xs': 200,
+    'sm': 480,
+    'md': 768,
+    'lg': 1280,
+}
+
+# S3/CDN config — from env or ~/.cdnbuddy/config.json
+CONFIG_FILE = HOME / 'config.json'
+DEFAULT_CONFIG = {
+    'watch_dirs': ['/var/www/daigtas-platform/public/uploads'],
+    's3_bucket': 'aws-boottify',
+    's3_region': 'eu-central-1',
+    'cdn_base_url': 'https://cdn.boottify.com',
+    'local_base_path': '/var/www/daigtas-platform/public',
+    'quality': 85,
+    'poll_interval': 10,
+    'api_port': 8765,
+}
+
+
+def load_config():
+    if CONFIG_FILE.exists():
+        return {**DEFAULT_CONFIG, **json.loads(CONFIG_FILE.read_text())}
+    return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+# ── Database ───────────────────────────────────────────────────────
+
+def get_db():
+    db = sqlite3.connect(str(DB_PATH))
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA busy_timeout=3000")
+    return db
+
+
+def init_db():
+    db = get_db()
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        local_path TEXT UNIQUE NOT NULL,
+        original_hash TEXT NOT NULL,
+        original_size INTEGER NOT NULL,
+        width INTEGER,
+        height INTEGER,
+        status TEXT DEFAULT 'pending',
+        error TEXT,
+        first_seen REAL NOT NULL,
+        last_processed REAL,
+        cdn_urls TEXT
+    );
+    CREATE TABLE IF NOT EXISTS variants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        image_id INTEGER NOT NULL,
+        size_label TEXT NOT NULL,
+        width INTEGER NOT NULL,
+        height INTEGER,
+        local_path TEXT,
+        cdn_url TEXT,
+        file_size INTEGER,
+        processed_at REAL NOT NULL,
+        FOREIGN KEY (image_id) REFERENCES images(id),
+        UNIQUE(image_id, size_label)
+    );
+    CREATE TABLE IF NOT EXISTS sync_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        path TEXT,
+        status TEXT NOT NULL,
+        detail TEXT,
+        timestamp REAL NOT NULL DEFAULT (strftime('%s','now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_images_status ON images(status);
+    CREATE INDEX IF NOT EXISTS idx_images_path ON images(local_path);
+    CREATE INDEX IF NOT EXISTS idx_variants_image ON variants(image_id);
+    """)
+    db.commit()
+    db.close()
+
+
+def log_action(action, path, status, detail=''):
+    db = get_db()
+    db.execute("INSERT INTO sync_log (action, path, status, detail) VALUES (?,?,?,?)",
+               (action, path, status, detail))
+    db.commit()
+    db.close()
+
+
+# ── Image Processing ───────────────────────────────────────────────
+
+def hash_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_image(path: str) -> Optional[dict]:
+    """Check if image is already indexed, return row or None"""
+    db = get_db()
+    row = db.execute("SELECT * FROM images WHERE local_path = ?", (path,)).fetchone()
+    db.close()
+    return dict(row) if row else None
+
+
+def process_image(filepath: str, cfg: dict) -> bool:
+    """Process a single image: generate WebP variants, upload to CDN"""
+    from PIL import Image
+
+    fpath = str(filepath)
+    fhash = hash_file(fpath)
+    fsize = os.path.getsize(fpath)
+
+    # Check if already processed with same hash
+    existing = get_image(fpath)
+    if existing and existing['original_hash'] == fhash and existing['status'] == 'synced':
+        return True  # Already up to date
+
+    db = get_db()
+    now = time.time()
+
+    try:
+        img = Image.open(fpath)
+        orig_w, orig_h = img.size
+    except Exception as e:
+        db.execute("INSERT OR REPLACE INTO images (local_path, original_hash, original_size, status, error, first_seen) VALUES (?,?,?,?,?,?)",
+                   (fpath, fhash, fsize, 'error', str(e), now))
+        db.commit()
+        db.close()
+        log_action('process', fpath, 'error', str(e))
+        return False
+
+    # Insert/update image record
+    db.execute("""
+        INSERT OR REPLACE INTO images
+        (local_path, original_hash, original_size, width, height, status, first_seen, last_processed)
+        VALUES (?, ?, ?, ?, ?, 'processing', COALESCE((SELECT first_seen FROM images WHERE local_path=?), ?), ?)
+    """, (fpath, fhash, fsize, orig_w, orig_h, fpath, now, now))
+    db.commit()
+    img_id = db.execute("SELECT id FROM images WHERE local_path = ?", (fpath,)).fetchone()[0]
+
+    # Generate WebP variants
+    local_base = Path(fpath)
+    base_name = local_base.stem
+    parent_dir = local_base.parent
+    cdn_urls = {}
+    variants_ok = 0
+
+    for label, target_w in SIZES.items():
+        # Only downscale — skip if original is smaller
+        if target_w >= orig_w:
+            continue
+
+        # Calculate proportional height
+        ratio = target_w / orig_w
+        target_h = int(orig_h * ratio)
+
+        # Generate variant
+        variant_path = parent_dir / f"{base_name}-{label}.webp"
+        variant_local = str(variant_path)
+
+        # Create resized copy
+        resized = img.resize((target_w, target_h), Image.LANCZOS)
+        resized.save(variant_local, 'WEBP', quality=cfg['quality'])
+
+        v_size = os.path.getsize(variant_local)
+
+        # Upload to CDN
+        cdn_path = str(variant_path).replace(cfg['local_base_path'], '').lstrip('/')
+        cdn_url = upload_to_cdn(variant_local, cdn_path, cfg)
+
+        # Record variant
+        db.execute("""
+            INSERT OR REPLACE INTO variants
+            (image_id, size_label, width, height, local_path, cdn_url, file_size, processed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (img_id, label, target_w, target_h, variant_local, cdn_url, v_size, now))
+
+        cdn_urls[label] = cdn_url
+        variants_ok += 1
+
+    # Upload original to CDN too
+    orig_cdn_path = str(fpath).replace(cfg['local_base_path'], '').lstrip('/')
+    orig_cdn_url = upload_to_cdn(fpath, orig_cdn_path, cfg)
+
+    # Mark as synced
+    db.execute("""
+        UPDATE images SET status='synced', last_processed=?, cdn_urls=? WHERE id=?
+    """, (now, json.dumps(cdn_urls), img_id))
+
+    db.commit()
+    db.close()
+
+    log_action('process', fpath, 'synced',
+               f"{variants_ok} WebP variants ({', '.join(cdn_urls.keys())})")
+    print(f"  ✓ {os.path.basename(fpath)} → {variants_ok} WebP variants synced")
+    return True
+
+
+def upload_to_cdn(local_path: str, cdn_path: str, cfg: dict) -> str:
+    """Upload file to S3/CDN. Returns CDN URL."""
+    bucket = cfg['s3_bucket']
+    region = cfg['s3_region']
+    cdn_url = f"{cfg['cdn_base_url']}/{cdn_path}"
+
+    try:
+        import boto3
+        s3 = boto3.client('s3', region_name=region)
+        content_type = 'image/webp' if local_path.endswith('.webp') else 'image/jpeg'
+        s3.upload_file(
+            local_path, bucket, cdn_path,
+            ExtraArgs={'ContentType': content_type, 'CacheControl': 'max-age=31536000, immutable'}
+        )
+    except ImportError:
+        # Fallback: just copy to local CDN-simulated path
+        dest = Path(cfg['local_base_path']) / cdn_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(local_path, dest)
+    except Exception as e:
+        cdn_url = f"local://{cdn_path}"
+        log_action('upload', cdn_path, 'error', str(e))
+
+    return cdn_url
+
+
+# ── Watcher ────────────────────────────────────────────────────────
+
+def scan_and_process(watch_dir: str, cfg: dict):
+    """Scan directory for new/changed images and process them."""
+    supported = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+    count = 0
+
+    for root, dirs, files in os.walk(watch_dir):
+        # Skip cache dirs
+        dirs[:] = [d for d in dirs if d not in {'.cache', 'node_modules', '.git'}]
+
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in supported:
+                continue
+            # Skip existing variant files
+            if any(fname.endswith(f'-{s}.webp') for s in SIZES):
+                continue
+
+            fpath = os.path.join(root, fname)
+            fhash = hash_file(fpath)
+            existing = get_image(fpath)
+
+            if existing and existing['original_hash'] == fhash and existing['status'] == 'synced':
+                continue  # Already processed
+
+            if process_image(fpath, cfg):
+                count += 1
+
+    return count
+
+
+def watch_loop(cfg: dict):
+    """Main watch loop — poll for changes"""
+    print(f"CDNBuddy v{VERSION} — watching for uploads...")
+    print(f"  Dirs: {cfg['watch_dirs']}")
+    print(f"  CDN:  {cfg['cdn_base_url']}")
+    print(f"  Sizes: {', '.join(f'{k}({v}px)' for k,v in SIZES.items())}")
+    print()
+
+    try:
+        from watchdog.observers import Observer
+        from watchdog.events import FileSystemEventHandler
+
+        class UploadHandler(FileSystemEventHandler):
+            def on_created(self, event):
+                if event.is_directory:
+                    return
+                ext = os.path.splitext(event.src_path)[1].lower()
+                if ext in {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}:
+                    if not any(event.src_path.endswith(f'-{s}.webp') for s in SIZES):
+                        print(f"  📷 {os.path.basename(event.src_path)}")
+                        process_image(event.src_path, cfg)
+
+        observer = Observer()
+        for d in cfg['watch_dirs']:
+            if os.path.isdir(d):
+                observer.schedule(UploadHandler(), d, recursive=True)
+        observer.start()
+
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+        observer.join()
+
+    except ImportError:
+        print("  (watchdog not installed — using polling mode)")
+        while True:
+            try:
+                for d in cfg['watch_dirs']:
+                    if os.path.isdir(d):
+                        n = scan_and_process(d, cfg)
+                        if n:
+                            print(f"  Processed {n} new images in {d}")
+                time.sleep(cfg['poll_interval'])
+            except KeyboardInterrupt:
+                break
+
+
+# ── API Server ─────────────────────────────────────────────────────
+
+def create_api(cfg: dict):
+    """Create FastAPI app for CDNBuddy"""
+    try:
+        from fastapi import FastAPI, HTTPException
+        from fastapi.responses import JSONResponse
+        import uvicorn
+    except ImportError:
+        print("FastAPI not installed. Run: pip install fastapi uvicorn")
+        sys.exit(1)
+
+    app = FastAPI(title="CDNBuddy API", version=VERSION)
+
+    @app.get("/api/status")
+    def get_status():
+        db = get_db()
+        total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        synced = db.execute("SELECT COUNT(*) FROM images WHERE status='synced'").fetchone()[0]
+        pending = db.execute("SELECT COUNT(*) FROM images WHERE status='pending'").fetchone()[0]
+        errors = db.execute("SELECT COUNT(*) FROM images WHERE status='error'").fetchone()[0]
+        variants = db.execute("SELECT COUNT(*) FROM variants").fetchone()[0]
+        recent = db.execute(
+            "SELECT action, path, status, detail, datetime(timestamp,'unixepoch','localtime') as dt "
+            "FROM sync_log ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+        db.close()
+        return {
+            'version': VERSION,
+            'images': {'total': total, 'synced': synced, 'pending': pending, 'errors': errors},
+            'variants': variants,
+            'recent_logs': [dict(r) for r in recent]
+        }
+
+    @app.post("/api/sync")
+    def trigger_sync(dir: str = None):
+        dirs = [dir] if dir else cfg['watch_dirs']
+        count = 0
+        for d in dirs:
+            if os.path.isdir(d):
+                count += scan_and_process(d, cfg)
+        return {'synced': count, 'message': f'Synced {count} images'}
+
+    @app.post("/api/process")
+    def trigger_process(path: str):
+        if not os.path.isfile(path):
+            raise HTTPException(404, f"File not found: {path}")
+        ok = process_image(path, cfg)
+        return {'status': 'ok' if ok else 'error', 'path': path}
+
+    @app.get("/api/images")
+    def list_images(limit: int = 50, status: str = None):
+        db = get_db()
+        q = "SELECT * FROM images"
+        params = []
+        if status:
+            q += " WHERE status = ?"
+            params.append(status)
+        q += " ORDER BY last_processed DESC LIMIT ?"
+        params.append(limit)
+        rows = db.execute(q, params).fetchall()
+        db.close()
+        return [dict(r) for r in rows]
+
+    @app.get("/api/image/{image_id}")
+    def get_image_detail(image_id: int):
+        db = get_db()
+        img = db.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+        if not img:
+            raise HTTPException(404, "Image not found")
+        variants = db.execute("SELECT * FROM variants WHERE image_id = ?", (image_id,)).fetchall()
+        db.close()
+        return {'image': dict(img), 'variants': [dict(v) for v in variants]}
+
+    return app
+
+
+# ── CLI ────────────────────────────────────────────────────────────
+
+def cmd_watch(args):
+    cfg = load_config()
+    if args.dir:
+        cfg['watch_dirs'] = args.dir.split(',')
+    init_db()
+    watch_loop(cfg)
+
+
+def cmd_sync(args):
+    cfg = load_config()
+    if args.dir:
+        cfg['watch_dirs'] = args.dir.split(',')
+    init_db()
+    print(f"CDNBuddy v{VERSION} — Manual sync")
+    total = 0
+    for d in cfg['watch_dirs']:
+        if os.path.isdir(d):
+            n = scan_and_process(d, cfg)
+            total += n
+            print(f"  {d}: {n} images processed")
+    print(f"Total: {total} images synced")
+
+
+def cmd_process(args):
+    cfg = load_config()
+    init_db()
+    ok = process_image(args.file, cfg)
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_status(args):
+    cfg = load_config()
+    init_db()
+    db = get_db()
+    total = db.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+    synced = db.execute("SELECT COUNT(*) FROM images WHERE status='synced'").fetchone()[0]
+    pending = db.execute("SELECT COUNT(*) FROM images WHERE status='pending'").fetchone()[0]
+    errors = db.execute("SELECT COUNT(*) FROM images WHERE status='error'").fetchone()[0]
+    variants = db.execute("SELECT COUNT(*) FROM variants").fetchone()[0]
+
+    print(f"  CDNBuddy v{VERSION}")
+    print(f"  {'─'*40}")
+    print(f"  Images:   {total} total ({synced} synced, {pending} pending, {errors} errors)")
+    print(f"  Variants: {variants}")
+    print(f"  CDN:      {cfg['cdn_base_url']}")
+    print(f"  Sizes:    {', '.join(f'{k}({v}px)' for k,v in SIZES.items())}")
+
+    # Recent errors
+    err_rows = db.execute(
+        "SELECT path, detail, datetime(timestamp,'unixepoch','localtime') as dt "
+        "FROM sync_log WHERE status='error' ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    if err_rows:
+        print(f"\n  Recent errors:")
+        for r in err_rows:
+            print(f"    {r['dt']} | {os.path.basename(r['path'])} | {r['detail'][:80]}")
+
+    db.close()
+
+
+def cmd_serve(args):
+    cfg = load_config()
+    init_db()
+    app = create_api(cfg)
+    import uvicorn
+    port = args.port or cfg['api_port']
+    print(f"CDNBuddy API v{VERSION} → http://localhost:{port}")
+    uvicorn.run(app, host='0.0.0.0', port=port)
+
+
+def cmd_install(args):
+    """Install as systemd user service"""
+    cfg = load_config()
+    script_path = os.path.abspath(__file__)
+
+    service = f"""[Unit]
+Description=CDNBuddy — CDN sync & image optimization daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={sys.executable} {script_path} watch
+Restart=always
+RestartSec=10
+Environment=CDNBUDDY_HOME={HOME}
+StandardOutput=append:{LOG_PATH}
+StandardError=append:{LOG_PATH}
+
+[Install]
+WantedBy=default.target
+"""
+
+    service_path = os.path.expanduser('~/.config/systemd/user/cdnbuddy.service')
+    os.makedirs(os.path.dirname(service_path), exist_ok=True)
+    with open(service_path, 'w') as f:
+        f.write(service)
+
+    os.system('systemctl --user daemon-reload')
+    print(f"✓ Service installed: {service_path}")
+    print(f"  Start: systemctl --user start cdnbuddy")
+    print(f"  Enable: systemctl --user enable cdnbuddy")
+
+
+# ── Main ───────────────────────────────────────────────────────────
+
+def main():
+    p = argparse.ArgumentParser(description='CDNBuddy — CDN sync & image optimization')
+    p.add_argument('--version', '-v', action='store_true', help='Show version')
+    sp = p.add_subparsers(dest='command')
+
+    sp.add_parser('watch', help='Start file watcher').add_argument('--dir', help='Watch directory override')
+    sp.add_parser('sync', help='Manual full sync').add_argument('--dir', help='Sync directory override')
+    sp.add_parser('process', help='Process single image').add_argument('file', help='Image path')
+    sp.add_parser('status', help='Show sync status')
+    srv = sp.add_parser('serve', help='Start API server')
+    srv.add_argument('--port', type=int, help='API port')
+    sp.add_parser('install', help='Install as systemd service')
+    sp.add_parser('config', help='Show current config')
+
+    args = p.parse_args()
+
+    if args.version:
+        print(f'CDNBuddy v{VERSION}')
+        return
+
+    if args.command == 'config':
+        cfg = load_config()
+        print(json.dumps(cfg, indent=2))
+        return
+
+    if not args.command:
+        p.print_help()
+        return
+
+    # Ensure we can import Pillow before doing image work
+    if args.command in ('watch', 'sync', 'process'):
+        try:
+            from PIL import Image  # noqa
+        except ImportError:
+            print("Pillow not installed. Run: pip install Pillow")
+            sys.exit(1)
+
+    {'watch': cmd_watch, 'sync': cmd_sync, 'process': cmd_process,
+     'status': cmd_status, 'serve': cmd_serve, 'install': cmd_install}[args.command](args)
+
+
+if __name__ == '__main__':
+    main()
